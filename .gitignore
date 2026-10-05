@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+.local-test/
+*.exe
+*.pdb
+__pycache__/
+build.zig.zon.lock  # if present
