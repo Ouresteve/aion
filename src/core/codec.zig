@@ -10,7 +10,7 @@ const types = @import("types.zig");
 
 pub const VERSION: u8 = 1;
 const HEADER_SIZE: usize = 6;
-const TRANSACTION_SIZE: usize = 152;
+const TRANSACTION_SIZE: usize = transaction.TX_SIZE; // 153
 const CONSENSUS_SIZE: usize = 144;
 const BLOCK_HEADER_SIZE: usize = 8 + 32 + 8 + 32 + 1 + 8 + 32 + 4;
 const CERTIFICATE_HEADER_SIZE: usize = 8 + 8 + 32 + 4;
@@ -212,24 +212,17 @@ fn messageTag(message: network.Message) u8 {
 }
 
 fn encodeTransaction(output: []u8, tx: transaction.SettlementTx) void {
-    @memcpy(output[0..32], &tx.from);
-    @memcpy(output[32..64], &tx.to);
-    std.mem.writeInt(u128, output[64..80], tx.amount, .little);
-    std.mem.writeInt(u64, output[80..88], tx.nonce, .little);
-    const signature_bytes = crypto.signatureBytes(tx.signature);
-    @memcpy(output[88..152], &signature_bytes);
+    std.debug.assert(output.len >= transaction.TX_SIZE);
+    var buf: [transaction.TX_SIZE]u8 = undefined;
+    tx.encode(&buf);
+    @memcpy(output[0..transaction.TX_SIZE], &buf);
 }
 
 fn decodeTransaction(input: []const u8) transaction.SettlementTx {
-    var signature_bytes: [crypto.Signature.encoded_length]u8 = undefined;
-    @memcpy(&signature_bytes, input[88..152]);
-    return .{
-        .from = input[0..32].*,
-        .to = input[32..64].*,
-        .amount = std.mem.readInt(u128, input[64..80], .little),
-        .nonce = std.mem.readInt(u64, input[80..88], .little),
-        .signature = crypto.signatureFromBytes(signature_bytes),
-    };
+    std.debug.assert(input.len >= transaction.TX_SIZE);
+    var buf: [transaction.TX_SIZE]u8 = undefined;
+    @memcpy(&buf, input[0..transaction.TX_SIZE]);
+    return transaction.SettlementTx.decode(&buf);
 }
 
 fn encodeProposal(output: []u8, proposal: bft.Proposal) void {
