@@ -18,7 +18,9 @@ pub const tcp = @import("tcp.zig");
 pub const metrics = @import("metrics.zig");
 pub const http = @import("http.zig");
 pub const service = @import("service.zig");
+pub const storage = @import("storage.zig");
 
+pub const Storage = storage.Storage;
 pub const MicroAion = types.MicroAion;
 pub const Address = types.Address;
 pub const Nonce = types.Nonce;
