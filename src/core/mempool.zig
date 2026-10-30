@@ -89,6 +89,8 @@ pub const Mempool = struct {
 
     /// Select executable transactions in deterministic sender/nonce order.
     /// The temporary state prevents overspending and nonce gaps in a proposal.
+    /// Among ready senders we pick the lexicographically smallest address first
+    /// so the resulting block is fully deterministic.
     pub fn selectForBlock(
         self: *const Mempool,
         allocator: std.mem.Allocator,
@@ -103,7 +105,8 @@ pub const Mempool = struct {
 
         while (selected.items.len < limit) {
             var best: ?transaction.SettlementTx = null;
-            var best_id: types.Hash = undefined;
+            var best_sender: types.Address = undefined;
+
             var iterator = self.senders.iterator();
             while (iterator.next()) |entry| {
                 const sender = entry.key_ptr.*;
@@ -113,9 +116,9 @@ pub const Mempool = struct {
                 const candidate = self.transactions.get(id) orelse continue;
                 if (account == null or !account.?.canAfford(candidate.amount)) continue;
 
-                if (best == null or std.mem.order(u8, entry.key_ptr, &best_id) == .lt) {
+                if (best == null or std.mem.order(u8, &sender, &best_sender) == .lt) {
                     best = candidate;
-                    best_id = entry.key_ptr.*;
+                    best_sender = sender;
                 }
             }
 
@@ -163,4 +166,181 @@ test "mempool validates, deduplicates, and orders executable transactions" {
     try std.testing.expect(!mempool.remove(first_id));
     try std.testing.expectEqual(@as(usize, 0), mempool.count());
     try std.testing.expectEqual(@as(usize, 0), mempool.senders.count());
+}
+
+test "mempool rejects stale nonce" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x61));
+    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x62));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = state_mod.State.init(allocator);
+    defer state.deinit();
+    const acc = try state.getOrCreate(sender);
+    acc.balance = 100;
+    acc.nonce = 5; // account already used nonces 0..4
+
+    var mempool = Mempool.init(allocator, 8);
+    defer mempool.deinit();
+
+    var tx = transaction.SettlementTx{
+        .from = sender,
+        .to = receiver,
+        .amount = 10,
+        .nonce = 3, // stale
+    };
+    try tx.sign(sender_keys);
+
+    try std.testing.expectError(error.StaleNonce, mempool.add(&state, tx));
+    try std.testing.expectEqual(@as(usize, 0), mempool.count());
+}
+
+test "mempool rejects duplicate nonce from same sender" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x71));
+    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x72));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = state_mod.State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 100;
+
+    var mempool = Mempool.init(allocator, 8);
+    defer mempool.deinit();
+
+    var first = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 10, .nonce = 0 };
+    try first.sign(sender_keys);
+    _ = try mempool.add(&state, first);
+
+    // Different amount but same nonce → must be rejected
+    var conflict = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 20, .nonce = 0 };
+    try conflict.sign(sender_keys);
+
+    try std.testing.expectError(error.DuplicateNonce, mempool.add(&state, conflict));
+    try std.testing.expectEqual(@as(usize, 1), mempool.count());
+}
+
+test "mempool rejects when full" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x81));
+    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x82));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = state_mod.State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 1000;
+
+    var mempool = Mempool.init(allocator, 2); // tiny capacity
+    defer mempool.deinit();
+
+    var tx0 = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 1, .nonce = 0 };
+    var tx1 = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 1, .nonce = 1 };
+    var tx2 = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 1, .nonce = 2 };
+    try tx0.sign(sender_keys);
+    try tx1.sign(sender_keys);
+    try tx2.sign(sender_keys);
+
+    _ = try mempool.add(&state, tx0);
+    _ = try mempool.add(&state, tx1);
+    try std.testing.expectError(error.MempoolFull, mempool.add(&state, tx2));
+    try std.testing.expectEqual(@as(usize, 2), mempool.count());
+}
+
+test "mempool accepts future nonce but does not select across a gap" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x91));
+    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x92));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = state_mod.State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 100;
+
+    var mempool = Mempool.init(allocator, 8);
+    defer mempool.deinit();
+
+    // Only submit nonce 2 (gap at 0 and 1)
+    var future = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 10, .nonce = 2 };
+    try future.sign(sender_keys);
+    _ = try mempool.add(&state, future);
+    try std.testing.expectEqual(@as(usize, 1), mempool.count());
+
+    const selected = try mempool.selectForBlock(allocator, &state, 10);
+    defer allocator.free(selected);
+    // Nothing executable because nonce 0 is missing
+    try std.testing.expectEqual(@as(usize, 0), selected.len);
+}
+
+test "mempool does not select transaction that would overspend" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xA1));
+    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xA2));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = state_mod.State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 50;
+
+    var mempool = Mempool.init(allocator, 8);
+    defer mempool.deinit();
+
+    var expensive = transaction.SettlementTx{ .from = sender, .to = receiver, .amount = 60, .nonce = 0 };
+    try expensive.sign(sender_keys);
+    _ = try mempool.add(&state, expensive); // accepted into pool
+
+    const selected = try mempool.selectForBlock(allocator, &state, 10);
+    defer allocator.free(selected);
+    try std.testing.expectEqual(@as(usize, 0), selected.len); // cannot afford
+    try std.testing.expectEqual(@as(usize, 1), mempool.count()); // still in pool
+}
+
+test "selection is deterministic across multiple senders" {
+    const allocator = std.testing.allocator;
+    const keys_a = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xB1));
+    const keys_b = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xB2));
+    const keys_c = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xB3));
+    const addr_a = @import("crypto.zig").addressFromPublicKey(keys_a.public_key);
+    const addr_b = @import("crypto.zig").addressFromPublicKey(keys_b.public_key);
+    const addr_c = @import("crypto.zig").addressFromPublicKey(keys_c.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(
+        (try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xB4))).public_key,
+    );
+
+    var state = state_mod.State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(addr_a)).balance = 100;
+    (try state.getOrCreate(addr_b)).balance = 100;
+    (try state.getOrCreate(addr_c)).balance = 100;
+
+    var mempool = Mempool.init(allocator, 16);
+    defer mempool.deinit();
+
+    var tx_a = transaction.SettlementTx{ .from = addr_a, .to = receiver, .amount = 10, .nonce = 0 };
+    var tx_b = transaction.SettlementTx{ .from = addr_b, .to = receiver, .amount = 10, .nonce = 0 };
+    var tx_c = transaction.SettlementTx{ .from = addr_c, .to = receiver, .amount = 10, .nonce = 0 };
+    try tx_a.sign(keys_a);
+    try tx_b.sign(keys_b);
+    try tx_c.sign(keys_c);
+
+    _ = try mempool.add(&state, tx_c);
+    _ = try mempool.add(&state, tx_a);
+    _ = try mempool.add(&state, tx_b);
+
+    const selected1 = try mempool.selectForBlock(allocator, &state, 3);
+    defer allocator.free(selected1);
+    const selected2 = try mempool.selectForBlock(allocator, &state, 3);
+    defer allocator.free(selected2);
+
+    try std.testing.expectEqual(@as(usize, 3), selected1.len);
+    try std.testing.expectEqual(@as(usize, 3), selected2.len);
+
+    // Same order every time (lexicographically smallest sender address first)
+    try std.testing.expectEqualSlices(u8, &selected1[0].from, &selected2[0].from);
+    try std.testing.expectEqualSlices(u8, &selected1[1].from, &selected2[1].from);
+    try std.testing.expectEqualSlices(u8, &selected1[2].from, &selected2[2].from);
 }

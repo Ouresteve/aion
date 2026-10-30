@@ -69,10 +69,17 @@ This document is a living inventory and should be updated as modules mature or c
 - **Missing / Risks:** Must be made fully deterministic and versioned. Needs extensive round-trip tests.
 
 ### mempool.zig
-- **Purpose:** Pending transaction pool.
-- **Status:** Partial
-- **Notes:** Basic acceptance and storage logic exists.
-- **Missing / Risks:** Nonce ordering, eviction policy, size limits, and DoS resistance need work.
+- **Purpose:** Bounded pending-transaction pool for block proposals.
+- **Status:** Solid (for current stage)
+- **Notes:** 
+  - Capacity limit enforced.
+  - Signature + basic validation on admission.
+  - Deduplication by transaction hash and by (address, nonce).
+  - Accepts future nonces; selection only emits contiguous nonces starting from the account’s current nonce.
+  - `selectForBlock` clones state, respects balance, and produces a deterministic order (lexicographically smallest ready sender first).
+  - Comprehensive unit tests for success paths, stale/duplicate nonce, capacity, gaps, overspend, and deterministic multi-sender selection.
+- **Missing / Risks (deferred):** Eviction policy under sustained load, fee-based prioritisation, and stronger DoS resistance (later cards).
+
 
 ### network.zig + tcp.zig
 - **Purpose:** Peer-to-peer networking foundation.
@@ -161,7 +168,7 @@ This document is a living inventory and should be updated as modules mature or c
 | Account & State model      | Partial            |
 | Transactions               | Partial            |
 | Blocks & Chain             | Experimental       |
-| Mempool                    | Partial            |
+| Mempool                    |Solid (currentStage)|
 | Networking                 | Experimental       |
 | Consensus                  | Experimental (undecided) |
 | Persistence                | Missing            |
