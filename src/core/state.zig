@@ -174,3 +174,76 @@ test "a balance overflow leaves both accounts unchanged" {
     try std.testing.expectEqual(@as(types.Nonce, 0), state.get(sender).?.nonce);
     try std.testing.expectEqual(std.math.maxInt(types.MicroAion), state.get(receiver).?.balance);
 }
+
+test "invalid signature is rejected" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").generateKeyPairDeterministic(@splat(0xB1));
+    const other_keys = try @import("crypto.zig").generateKeyPairDeterministic(@splat(0xB2));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(other_keys.public_key);
+
+    var state = State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 100;
+
+    var tx = transaction.SettlementTx{
+        .from = sender,
+        .to = receiver,
+        .amount = 10,
+        .nonce = 0,
+    };
+    // Sign with the wrong key on purpose
+    try tx.sign(other_keys);
+
+    try std.testing.expectError(error.InvalidSignature, state.applyTransaction(tx));
+    try std.testing.expectEqual(@as(types.MicroAion, 100), state.get(sender).?.balance);
+    try std.testing.expectEqual(@as(types.Nonce, 0), state.get(sender).?.nonce);
+}
+
+test "invalid nonce is rejected" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").generateKeyPairDeterministic(@splat(0xC1));
+    const receiver_keys = try @import("crypto.zig").generateKeyPairDeterministic(@splat(0xC2));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 100;
+
+    var tx = transaction.SettlementTx{
+        .from = sender,
+        .to = receiver,
+        .amount = 10,
+        .nonce = 5, // wrong nonce
+    };
+    try tx.sign(sender_keys);
+
+    try std.testing.expectError(error.InvalidNonce, state.applyTransaction(tx));
+    try std.testing.expectEqual(@as(types.MicroAion, 100), state.get(sender).?.balance);
+}
+
+test "successful transfer updates balances and nonce" {
+    const allocator = std.testing.allocator;
+    const sender_keys = try @import("crypto.zig").generateKeyPairDeterministic(@splat(0xD1));
+    const receiver_keys = try @import("crypto.zig").generateKeyPairDeterministic(@splat(0xD2));
+    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
+    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var state = State.init(allocator);
+    defer state.deinit();
+    (try state.getOrCreate(sender)).balance = 1000;
+
+    var tx = transaction.SettlementTx{
+        .from = sender,
+        .to = receiver,
+        .amount = 250,
+        .nonce = 0,
+    };
+    try tx.sign(sender_keys);
+    try state.applyTransaction(tx);
+
+    try std.testing.expectEqual(@as(types.MicroAion, 750), state.get(sender).?.balance);
+    try std.testing.expectEqual(@as(types.Nonce, 1), state.get(sender).?.nonce);
+    try std.testing.expectEqual(@as(types.MicroAion, 250), state.get(receiver).?.balance);
+}

@@ -49,3 +49,25 @@ pub const Account = struct {
         };
     }
 };
+
+test "debit fails on insufficient funds" {
+    var acc = Account.initWithBalance(50);
+    try std.testing.expectError(error.InsufficientFunds, acc.debit(51));
+    try std.testing.expect(acc.balance == 50);
+}
+
+test "debit succeeds when funds are exact" {
+    var acc = Account.initWithBalance(50);
+    try acc.debit(50);
+    try std.testing.expect(acc.balance == 0);
+}
+
+test "credit detects balance overflow" {
+    var acc = Account.initWithBalance(std.math.maxInt(types.MicroAion));
+    try std.testing.expectError(error.BalanceOverflow, acc.credit(1));
+}
+
+test "nonce overflow is detected" {
+    var acc = Account{ .balance = 0, .nonce = std.math.maxInt(types.Nonce) };
+    try std.testing.expectError(error.NonceOverflow, acc.incrementNonce());
+}
