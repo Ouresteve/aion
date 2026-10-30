@@ -254,3 +254,55 @@ test "a rejected block leaves the canonical chain and ledger untouched" {
     try std.testing.expectEqual(@as(types.MicroAion, 1), chain.state.get(sender).?.balance);
     try std.testing.expect(chain.state.get(receiver) == null);
 }
+
+test "genesis block has expected shape" {
+    const allocator = std.testing.allocator;
+    var chain = try Chain.init(allocator, 12345);
+    defer chain.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), chain.height());
+    const genesis = chain.tip();
+    try std.testing.expectEqual(@as(u64, 0), genesis.header.height);
+    try std.testing.expectEqualSlices(u8, &types.ZERO_HASH, &genesis.header.previous_hash);
+    try std.testing.expectEqual(@as(u64, 12345), genesis.header.timestamp);
+    try std.testing.expectEqual(@as(usize, 0), genesis.transactions.len);
+    try std.testing.expect(genesis.isHashValid());
+}
+
+test "block with wrong parent hash is rejected" {
+    const allocator = std.testing.allocator;
+    var chain = try Chain.init(allocator, 1);
+    defer chain.deinit();
+
+    var candidate = try block_mod.Block.init(
+        allocator,
+        1,
+        @splat(0xFF), // wrong parent
+        2,
+        &.{},
+        0,
+    );
+    defer candidate.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidParent, chain.appendProofOfWork(candidate));
+    try std.testing.expectEqual(@as(u64, 0), chain.height());
+}
+
+test "block with wrong height is rejected" {
+    const allocator = std.testing.allocator;
+    var chain = try Chain.init(allocator, 1);
+    defer chain.deinit();
+
+    var candidate = try block_mod.Block.init(
+        allocator,
+        5, // should be 1
+        chain.tip().hash,
+        2,
+        &.{},
+        0,
+    );
+    defer candidate.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidHeight, chain.appendProofOfWork(candidate));
+    try std.testing.expectEqual(@as(u64, 0), chain.height());
+}
