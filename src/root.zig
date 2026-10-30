@@ -3,6 +3,11 @@
 
 const std = @import("std");
 
+// Pull in cryptographic test vectors
+comptime {
+    _ = @import("core/tests/ed25519_vectors.zig");
+}
+
 pub const core = @import("core/mod.zig");
 
 pub const version = "0.1.0";
