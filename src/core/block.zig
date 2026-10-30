@@ -82,6 +82,30 @@ pub const Block = struct {
     pub fn isHashValid(self: Block) bool {
         return std.mem.eql(u8, &self.hash, &self.calculateHash());
     }
+
+    /// Validate block structure and internal consistency.
+    /// Does not apply transactions to state and does not check consensus rules.
+    pub fn validate(self: Block, allocator: std.mem.Allocator) !void {
+        if (self.transactions.len > MAX_TRANSACTIONS) {
+            return error.BlockTooLarge;
+        }
+
+        if (!self.isHashValid()) {
+            return error.InvalidBlockHash;
+        }
+
+        const expected_root = try merkleRoot(allocator, self.transactions);
+        if (!std.mem.eql(u8, &self.header.transaction_root, &expected_root)) {
+            return error.InvalidTransactionRoot;
+        }
+
+        for (self.transactions) |tx| {
+            try tx.validateBasic();
+            if (!tx.verify()) {
+                return error.InvalidTransactionSignature;
+            }
+        }
+    }
 };
 
 pub fn merkleRoot(allocator: std.mem.Allocator, transactions: []const transaction.SettlementTx) !types.Hash {
@@ -120,4 +144,48 @@ test "block hash changes when header changes" {
     try std.testing.expect(block.isHashValid());
     block.header.nonce = 1;
     try std.testing.expect(!block.isHashValid());
+}
+
+test "empty block validates" {
+    const allocator = std.testing.allocator;
+    var block = try Block.init(allocator, 0, types.ZERO_HASH, 1, &.{}, 0);
+    defer block.deinit(allocator);
+    try block.validate(allocator);
+}
+
+test "block with one valid transaction validates" {
+    const allocator = std.testing.allocator;
+    const key_pair = try crypto.generateKeyPairDeterministic(@splat(0x42));
+    const from = crypto.addressFromPublicKey(key_pair.public_key);
+    const to = types.ZERO_ADDRESS;
+
+    var tx = transaction.SettlementTx{
+        .from = from,
+        .to = to,
+        .amount = 1,
+        .nonce = 0,
+    };
+    try tx.sign(key_pair);
+
+    var block = try Block.init(allocator, 1, types.ZERO_HASH, 100, &.{tx}, 0);
+    defer block.deinit(allocator);
+    try block.validate(allocator);
+}
+
+test "tampered transaction root is rejected" {
+    const allocator = std.testing.allocator;
+    var block = try Block.init(allocator, 0, types.ZERO_HASH, 1, &.{}, 0);
+    defer block.deinit(allocator);
+
+    block.header.transaction_root = @splat(0xFF);
+    block.hash = block.calculateHash(); // keep hash consistent with header
+    try std.testing.expectError(error.InvalidTransactionRoot, block.validate(allocator));
+}
+
+test "invalid block hash is rejected" {
+    const allocator = std.testing.allocator;
+    var block = try Block.init(allocator, 0, types.ZERO_HASH, 1, &.{}, 0);
+    defer block.deinit(allocator);
+    block.hash = @splat(0xAB);
+    try std.testing.expectError(error.InvalidBlockHash, block.validate(allocator));
 }
