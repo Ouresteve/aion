@@ -7,7 +7,7 @@ pub const state = @import("state.zig");
 pub const crypto = @import("crypto.zig");
 pub const block = @import("block.zig");
 pub const chain = @import("chain.zig");
-pub const pow = @import("pow.zig");
+
 pub const validator = @import("validator.zig");
 pub const bft = @import("bft.zig");
 pub const mempool = @import("mempool.zig");
@@ -63,8 +63,6 @@ pub const tcpReceiveFrameFromReader = tcp.receiveFrameFromReader;
 pub const Metrics = metrics.Metrics;
 pub const serveMetricsConnection = http.serveMetricsConnection;
 pub const Service = service.Service;
-pub const mine = pow.mine;
-pub const meetsDifficulty = pow.meetsDifficulty;
 
 pub const KeyPair = crypto.KeyPair;
 pub const PublicKey = crypto.PublicKey;

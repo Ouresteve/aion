@@ -1,5 +1,6 @@
 //! Canonical chain storage and block/state validation.
 //!
+//! Consensus path is stake-weighted BFT only (ADR-0005).
 //! When a Storage is supplied the chain becomes durable:
 //! - Every successfully committed block is written to disk.
 //! - On startup the chain can be rebuilt by replaying the stored blocks.
@@ -8,7 +9,6 @@
 const std = @import("std");
 const bft = @import("bft.zig");
 const block_mod = @import("block.zig");
-const pow = @import("pow.zig");
 const state_mod = @import("state.zig");
 const storage_mod = @import("storage.zig");
 const types = @import("types.zig");
@@ -36,10 +36,7 @@ pub const Chain = struct {
         };
     }
 
-    /// Create a chain that is backed by durable storage.
-    /// - If the store is empty a genesis block is created and immediately saved.
-    /// - If the store already contains blocks they are loaded, validated and replayed
-    ///   so that `state` is fully recovered.
+    /// Create a chain backed by durable storage (replay-only recovery).
     pub fn initWithStorage(
         allocator: std.mem.Allocator,
         storage: *storage_mod.Storage,
@@ -52,14 +49,12 @@ pub const Chain = struct {
         }
 
         if (loaded.len == 0) {
-            // Fresh store → create genesis and persist it.
             var chain = try Chain.init(allocator, genesis_timestamp);
             chain.storage = storage;
             try storage.saveBlock(chain.blocks[0]);
             return chain;
         }
 
-        // Replay path.
         if (loaded[0].header.height != 0) {
             for (loaded) |*b| b.deinit(allocator);
             allocator.free(loaded);
@@ -69,7 +64,6 @@ pub const Chain = struct {
         var state = state_mod.State.init(allocator);
         errdefer state.deinit();
 
-        // Apply transactions from every block after genesis.
         for (loaded[1..]) |block| {
             try state.applyTransactionsAtomic(block.transactions);
         }
@@ -86,7 +80,6 @@ pub const Chain = struct {
         for (self.blocks) |*block| block.deinit(self.allocator);
         self.allocator.free(self.blocks);
         self.state.deinit();
-        // Storage is not owned by Chain; caller is responsible for it.
     }
 
     pub fn height(self: *const Chain) u64 {
@@ -97,34 +90,7 @@ pub const Chain = struct {
         return &self.blocks[self.blocks.len - 1];
     }
 
-    pub fn produceProofOfWorkBlock(
-        self: *Chain,
-        timestamp: u64,
-        transactions: []const @import("transaction.zig").SettlementTx,
-        difficulty: u8,
-    ) !void {
-        var candidate = try block_mod.Block.init(
-            self.allocator,
-            self.height() + 1,
-            self.tip().hash,
-            timestamp,
-            transactions,
-            difficulty,
-        );
-        defer candidate.deinit(self.allocator);
-
-        try pow.mine(&candidate);
-        try self.appendProofOfWork(candidate);
-    }
-
-    pub fn appendProofOfWork(self: *Chain, candidate: block_mod.Block) !void {
-        try self.validateCandidate(candidate);
-        if (!pow.meetsDifficulty(candidate.hash, candidate.header.difficulty)) {
-            return error.InsufficientProofOfWork;
-        }
-        try self.commitCandidate(candidate);
-    }
-
+    /// Commit a block that carries a valid BFT proposal and quorum certificate.
     pub fn appendFinalized(
         self: *Chain,
         candidate: block_mod.Block,
@@ -132,8 +98,11 @@ pub const Chain = struct {
         certificate: bft.QuorumCertificate,
         validators: validator_mod.ValidatorSet,
     ) !void {
+        // BFT blocks must not carry a PoW difficulty.
         if (candidate.header.difficulty != 0) return error.InvalidBftDifficulty;
+
         try self.validateCandidate(candidate);
+
         if (proposal.height != candidate.header.height or proposal.round != certificate.round) {
             return error.InvalidProposal;
         }
@@ -144,6 +113,7 @@ pub const Chain = struct {
             return error.InvalidCertificateBlock;
         }
         if (!certificate.verify(validators)) return error.InvalidQuorumCertificate;
+
         try self.commitCandidate(candidate);
     }
 
@@ -169,9 +139,6 @@ pub const Chain = struct {
     }
 
     fn commitCandidate(self: *Chain, candidate: block_mod.Block) !void {
-        // Execute against an isolated state copy before changing the canonical
-        // chain. This makes block/state commitment all-or-nothing even when a
-        // transaction fails validation or allocation fails during the transition.
         var next_state = try self.state.clone();
         errdefer next_state.deinit();
         try next_state.applyTransactionsAtomic(candidate.transactions);
@@ -179,8 +146,7 @@ pub const Chain = struct {
         var stored = try cloneBlock(self.allocator, candidate);
         errdefer stored.deinit(self.allocator);
 
-        // Persist first so a crash between disk write and memory update
-        // still leaves a recoverable chain (replay will rebuild state).
+        // Persist before mutating in-memory chain (crash recovery stays consistent).
         if (self.storage) |storage| {
             try storage.saveBlock(stored);
         }
@@ -199,51 +165,70 @@ fn cloneBlock(allocator: std.mem.Allocator, source: block_mod.Block) !block_mod.
 }
 
 // ---------------------------------------------------------------------------
-// Existing tests (unchanged)
+// Helpers used only by tests
 // ---------------------------------------------------------------------------
 
-test "chain appends a valid block and commits state atomically" {
-    const allocator = std.testing.allocator;
-    var chain = try Chain.init(allocator, 1);
-    defer chain.deinit();
-
-    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x11));
-    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x22));
-    const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
-    const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
-    (try chain.state.getOrCreate(sender)).balance = 100;
-
-    var tx = @import("transaction.zig").SettlementTx{
-        .from = sender,
-        .to = receiver,
-        .amount = 40,
-        .nonce = 0,
-    };
-    try tx.sign(sender_keys);
-    var candidate = try block_mod.Block.init(allocator, 1, chain.tip().hash, 2, &.{tx}, 1);
-    defer candidate.deinit(allocator);
-    try pow.mine(&candidate);
-    const mined_hash = candidate.hash;
-    const mined_nonce = candidate.header.nonce;
-
-    try chain.appendProofOfWork(candidate);
-    try std.testing.expectEqual(mined_hash, chain.tip().hash);
-    try std.testing.expectEqual(mined_nonce, chain.tip().header.nonce);
-    try std.testing.expectEqual(@as(u128, 60), chain.state.get(sender).?.balance);
-    try std.testing.expectEqual(@as(u128, 40), chain.state.get(receiver).?.balance);
+fn testKeyPair(seed: u8) !@import("crypto.zig").KeyPair {
+    return @import("crypto.zig").KeyPair.generateDeterministic(@splat(seed));
 }
+
+fn testAddress(seed: u8) !types.Address {
+    const kp = try testKeyPair(seed);
+    return @import("crypto.zig").addressFromPublicKey(kp.public_key);
+}
+
+fn signProposal(
+    height: u64,
+    round: u64,
+    block_hash: types.Hash,
+    proposer: types.Address,
+    keys: @import("crypto.zig").KeyPair,
+) !bft.Proposal {
+    var proposal = bft.Proposal{
+        .height = height,
+        .round = round,
+        .block_hash = block_hash,
+        .proposer = proposer,
+        .signature = undefined,
+    };
+    try proposal.sign(keys);
+    return proposal;
+}
+
+fn signVote(
+    height: u64,
+    round: u64,
+    block_hash: types.Hash,
+    voter: types.Address,
+    keys: @import("crypto.zig").KeyPair,
+) !bft.Vote {
+    var vote = bft.Vote{
+        .height = height,
+        .round = round,
+        .block_hash = block_hash,
+        .voter = voter,
+        .signature = undefined,
+    };
+    try vote.sign(keys);
+    return vote;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 test "chain commits a block finalized by a BFT quorum" {
     const allocator = std.testing.allocator;
     var chain = try Chain.init(allocator, 1);
     defer chain.deinit();
 
-    const first = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x31));
-    const second = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x32));
-    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0x33));
-    const first_address = @import("crypto.zig").addressFromPublicKey(first.public_key);
-    const second_address = @import("crypto.zig").addressFromPublicKey(second.public_key);
+    const first_keys = try testKeyPair(0x31);
+    const second_keys = try testKeyPair(0x32);
+    const receiver_keys = try testKeyPair(0x33);
+    const first_address = @import("crypto.zig").addressFromPublicKey(first_keys.public_key);
+    const second_address = @import("crypto.zig").addressFromPublicKey(second_keys.public_key);
     const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
     var validators = try validator_mod.ValidatorSet.init(allocator, &.{
         .{ .address = first_address, .stake = 50 },
         .{ .address = second_address, .stake = 30 },
@@ -251,47 +236,29 @@ test "chain commits a block finalized by a BFT quorum" {
     defer validators.deinit();
 
     (try chain.state.getOrCreate(first_address)).balance = 100;
+
     var tx = @import("transaction.zig").SettlementTx{
         .from = first_address,
         .to = receiver,
         .amount = 40,
         .nonce = 0,
     };
-    try tx.sign(first);
+    try tx.sign(first_keys);
+
+    // difficulty = 0 (BFT)
     var candidate = try block_mod.Block.init(allocator, 1, chain.tip().hash, 2, &.{tx}, 0);
     defer candidate.deinit(allocator);
 
-    var proposal = bft.Proposal{
-        .height = 1,
-        .round = 0,
-        .block_hash = candidate.hash,
-        .proposer = first_address,
-        .signature = undefined,
-    };
-    try proposal.sign(first);
-
-    var first_vote = bft.Vote{
-        .height = 1,
-        .round = 0,
-        .block_hash = candidate.hash,
-        .voter = first_address,
-        .signature = undefined,
-    };
-    var second_vote = bft.Vote{
-        .height = 1,
-        .round = 0,
-        .block_hash = candidate.hash,
-        .voter = second_address,
-        .signature = undefined,
-    };
-    try first_vote.sign(first);
-    try second_vote.sign(second);
-    var certificate = try bft.QuorumCertificate.init(allocator, 1, 0, candidate.hash, &.{ first_vote, second_vote });
+    const proposal = try signProposal(1, 0, candidate.hash, first_address, first_keys);
+    const v1 = try signVote(1, 0, candidate.hash, first_address, first_keys);
+    const v2 = try signVote(1, 0, candidate.hash, second_address, second_keys);
+    var certificate = try bft.QuorumCertificate.init(allocator, 1, 0, candidate.hash, &.{ v1, v2 });
     defer certificate.deinit();
 
     try chain.appendFinalized(candidate, proposal, certificate, validators);
     try std.testing.expectEqual(@as(u128, 60), chain.state.get(first_address).?.balance);
     try std.testing.expectEqual(@as(u128, 40), chain.state.get(receiver).?.balance);
+    try std.testing.expectEqual(@as(u64, 1), chain.height());
 }
 
 test "a rejected block leaves the canonical chain and ledger untouched" {
@@ -299,24 +266,36 @@ test "a rejected block leaves the canonical chain and ledger untouched" {
     var chain = try Chain.init(allocator, 10);
     defer chain.deinit();
 
-    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xB1));
-    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xB2));
+    const sender_keys = try testKeyPair(0xB1);
+    const receiver_keys = try testKeyPair(0xB2);
     const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
     const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
+
+    var validators = try validator_mod.ValidatorSet.init(allocator, &.{
+        .{ .address = sender, .stake = 100 },
+    });
+    defer validators.deinit();
+
     (try chain.state.getOrCreate(sender)).balance = 1;
     const genesis_hash = chain.tip().hash;
 
     var tx = @import("transaction.zig").SettlementTx{
         .from = sender,
         .to = receiver,
-        .amount = 2,
+        .amount = 2, // more than balance
         .nonce = 0,
     };
     try tx.sign(sender_keys);
+
     var candidate = try block_mod.Block.init(allocator, 1, genesis_hash, 11, &.{tx}, 0);
     defer candidate.deinit(allocator);
 
-    try std.testing.expectError(error.InsufficientFunds, chain.appendProofOfWork(candidate));
+    const proposal = try signProposal(1, 0, candidate.hash, sender, sender_keys);
+    const vote = try signVote(1, 0, candidate.hash, sender, sender_keys);
+    var certificate = try bft.QuorumCertificate.init(allocator, 1, 0, candidate.hash, &.{vote});
+    defer certificate.deinit();
+
+    try std.testing.expectError(error.InsufficientFunds, chain.appendFinalized(candidate, proposal, certificate, validators));
     try std.testing.expectEqual(@as(u64, 0), chain.height());
     try std.testing.expectEqual(genesis_hash, chain.tip().hash);
     try std.testing.expectEqual(@as(types.MicroAion, 1), chain.state.get(sender).?.balance);
@@ -334,6 +313,7 @@ test "genesis block has expected shape" {
     try std.testing.expectEqualSlices(u8, &types.ZERO_HASH, &genesis.header.previous_hash);
     try std.testing.expectEqual(@as(u64, 12345), genesis.header.timestamp);
     try std.testing.expectEqual(@as(usize, 0), genesis.transactions.len);
+    try std.testing.expectEqual(@as(u8, 0), genesis.header.difficulty);
     try std.testing.expect(genesis.isHashValid());
 }
 
@@ -342,17 +322,22 @@ test "block with wrong parent hash is rejected" {
     var chain = try Chain.init(allocator, 1);
     defer chain.deinit();
 
-    var candidate = try block_mod.Block.init(
-        allocator,
-        1,
-        @splat(0xFF), // wrong parent
-        2,
-        &.{},
-        0,
-    );
+    const keys = try testKeyPair(0x41);
+    const addr = @import("crypto.zig").addressFromPublicKey(keys.public_key);
+    var validators = try validator_mod.ValidatorSet.init(allocator, &.{
+        .{ .address = addr, .stake = 100 },
+    });
+    defer validators.deinit();
+
+    var candidate = try block_mod.Block.init(allocator, 1, @splat(0xFF), 2, &.{}, 0);
     defer candidate.deinit(allocator);
 
-    try std.testing.expectError(error.InvalidParent, chain.appendProofOfWork(candidate));
+    const proposal = try signProposal(1, 0, candidate.hash, addr, keys);
+    const vote = try signVote(1, 0, candidate.hash, addr, keys);
+    var certificate = try bft.QuorumCertificate.init(allocator, 1, 0, candidate.hash, &.{vote});
+    defer certificate.deinit();
+
+    try std.testing.expectError(error.InvalidParent, chain.appendFinalized(candidate, proposal, certificate, validators));
     try std.testing.expectEqual(@as(u64, 0), chain.height());
 }
 
@@ -361,23 +346,47 @@ test "block with wrong height is rejected" {
     var chain = try Chain.init(allocator, 1);
     defer chain.deinit();
 
-    var candidate = try block_mod.Block.init(
-        allocator,
-        5, // should be 1
-        chain.tip().hash,
-        2,
-        &.{},
-        0,
-    );
+    const keys = try testKeyPair(0x42);
+    const addr = @import("crypto.zig").addressFromPublicKey(keys.public_key);
+    var validators = try validator_mod.ValidatorSet.init(allocator, &.{
+        .{ .address = addr, .stake = 100 },
+    });
+    defer validators.deinit();
+
+    var candidate = try block_mod.Block.init(allocator, 5, chain.tip().hash, 2, &.{}, 0);
     defer candidate.deinit(allocator);
 
-    try std.testing.expectError(error.InvalidHeight, chain.appendProofOfWork(candidate));
+    const proposal = try signProposal(5, 0, candidate.hash, addr, keys);
+    const vote = try signVote(5, 0, candidate.hash, addr, keys);
+    var certificate = try bft.QuorumCertificate.init(allocator, 5, 0, candidate.hash, &.{vote});
+    defer certificate.deinit();
+
+    try std.testing.expectError(error.InvalidHeight, chain.appendFinalized(candidate, proposal, certificate, validators));
     try std.testing.expectEqual(@as(u64, 0), chain.height());
 }
 
-// ---------------------------------------------------------------------------
-// New recovery test – proves the acceptance criterion of Card 17
-// ---------------------------------------------------------------------------
+test "non-zero difficulty is rejected under BFT" {
+    const allocator = std.testing.allocator;
+    var chain = try Chain.init(allocator, 1);
+    defer chain.deinit();
+
+    const keys = try testKeyPair(0x43);
+    const addr = @import("crypto.zig").addressFromPublicKey(keys.public_key);
+    var validators = try validator_mod.ValidatorSet.init(allocator, &.{
+        .{ .address = addr, .stake = 100 },
+    });
+    defer validators.deinit();
+
+    var candidate = try block_mod.Block.init(allocator, 1, chain.tip().hash, 2, &.{}, 1); // difficulty 1
+    defer candidate.deinit(allocator);
+
+    const proposal = try signProposal(1, 0, candidate.hash, addr, keys);
+    const vote = try signVote(1, 0, candidate.hash, addr, keys);
+    var certificate = try bft.QuorumCertificate.init(allocator, 1, 0, candidate.hash, &.{vote});
+    defer certificate.deinit();
+
+    try std.testing.expectError(error.InvalidBftDifficulty, chain.appendFinalized(candidate, proposal, certificate, validators));
+}
 
 test "chain recovers state after restart from durable storage" {
     const allocator = std.testing.allocator;
@@ -387,14 +396,12 @@ test "chain recovers state after restart from durable storage" {
     const root = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(root);
 
-    const sender_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xC1));
-    const receiver_keys = try @import("crypto.zig").KeyPair.generateDeterministic(@splat(0xC2));
+    const sender_keys = try testKeyPair(0xC1);
+    const receiver_keys = try testKeyPair(0xC2);
     const sender = @import("crypto.zig").addressFromPublicKey(sender_keys.public_key);
     const receiver = @import("crypto.zig").addressFromPublicKey(receiver_keys.public_key);
 
-    // ----- First run: create chain, fund via direct state (demo style),
-    //       then commit a real transfer so the resulting balances are
-    //       fully derived from the chain and therefore recoverable.
+    // First run: commit a BFT-finalized transfer and persist it.
     {
         var storage = try storage_mod.Storage.init(allocator, root);
         defer storage.deinit();
@@ -402,7 +409,11 @@ test "chain recovers state after restart from durable storage" {
         var chain = try Chain.initWithStorage(allocator, &storage, 1);
         defer chain.deinit();
 
-        // Bootstrap balance (not durable by itself).
+        var validators = try validator_mod.ValidatorSet.init(allocator, &.{
+            .{ .address = sender, .stake = 100 },
+        });
+        defer validators.deinit();
+
         (try chain.state.getOrCreate(sender)).balance = 100;
 
         var tx = @import("transaction.zig").SettlementTx{
@@ -413,25 +424,21 @@ test "chain recovers state after restart from durable storage" {
         };
         try tx.sign(sender_keys);
 
-        var candidate = try block_mod.Block.init(allocator, 1, chain.tip().hash, 2, &.{tx}, 1);
+        var candidate = try block_mod.Block.init(allocator, 1, chain.tip().hash, 2, &.{tx}, 0);
         defer candidate.deinit(allocator);
-        try pow.mine(&candidate);
-        try chain.appendProofOfWork(candidate);
 
+        const proposal = try signProposal(1, 0, candidate.hash, sender, sender_keys);
+        const vote = try signVote(1, 0, candidate.hash, sender, sender_keys);
+        var certificate = try bft.QuorumCertificate.init(allocator, 1, 0, candidate.hash, &.{vote});
+        defer certificate.deinit();
+
+        try chain.appendFinalized(candidate, proposal, certificate, validators);
         try std.testing.expectEqual(@as(u64, 1), chain.height());
         try std.testing.expectEqual(@as(u128, 65), chain.state.get(sender).?.balance);
         try std.testing.expectEqual(@as(u128, 35), chain.state.get(receiver).?.balance);
     }
 
-    // ----- Second run: brand-new Chain + Storage pointing at the same directory.
-    //       State must be rebuilt purely by replaying the stored blocks.
-    //       Note: the original bootstrap balance of 100 is *not* recovered
-    //       (it never lived in a block). Only the transfer of 35 is recovered.
-    //       After replay the sender has 0 (never funded by a tx) and the
-    //       receiver has 35. This demonstrates pure replay semantics.
-    //
-    //       For a fully recoverable bootstrap we would place an allocation
-    //       transaction inside genesis or block 1. That is future work.
+    // Second run: pure replay — only balances derived from persisted txs survive.
     {
         var storage = try storage_mod.Storage.init(allocator, root);
         defer storage.deinit();
@@ -440,10 +447,7 @@ test "chain recovers state after restart from durable storage" {
         defer chain.deinit();
 
         try std.testing.expectEqual(@as(u64, 1), chain.height());
-        // Receiver balance comes from the persisted transfer.
         try std.testing.expectEqual(@as(u128, 35), chain.state.get(receiver).?.balance);
-        // Sender was never credited by a durable transaction, so after pure
-        // replay its balance is zero (or the account may be absent).
         if (chain.state.get(sender)) |acc| {
             try std.testing.expectEqual(@as(u128, 0), acc.balance);
             try std.testing.expectEqual(@as(u64, 1), acc.nonce);

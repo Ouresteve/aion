@@ -84,7 +84,6 @@ These limitations must be documented in every release note and in the security c
 
 ### Neutral
 
-- PoW code stays in the tree for research and possible future hybrid designs
 - A later ADR may introduce:
   - Timeout-based view change
   - VRF leader election
