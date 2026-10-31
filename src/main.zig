@@ -127,6 +127,7 @@ fn runNode(
         try service.addPeer(host, port);
     }
 
+    try service.startRelayWorker();
     try stdout.print("Aion node started\n", .{});
     try stdout.print("Listen:  {s}:{d}\n", .{ listen_host, peer_port });
     try stdout.print("Metrics: http://{s}:{d}/metrics\n", .{ metrics_host, metrics_port });
