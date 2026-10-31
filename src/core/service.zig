@@ -21,8 +21,8 @@ pub const Service = struct {
     relay_head: usize,
     relay_tail: usize,
     relay_count: usize,
-    relay_mutex: std.Thread.Mutex,
-    relay_ready: std.Thread.Condition,
+    relay_mutex: std.Io.Mutex,
+    relay_ready: std.Io.Condition,
     relay_stopping: bool,
     relay_thread: ?std.Thread,
 
@@ -42,7 +42,7 @@ pub const Service = struct {
     ) !Service {
         var peer_listener = try tcp.Listener.init(io, peer_host, peer_port);
         errdefer peer_listener.deinit();
-        const metrics_listener = try tcp.Listener.init(io, metrics_host, metrics_port);
+        var metrics_listener = try tcp.Listener.init(io, metrics_host, metrics_port);
         errdefer metrics_listener.deinit();
         const relay_queue = try allocator.alloc(transaction.SettlementTx, TRANSACTION_RELAY_CAPACITY);
         return .{
@@ -56,8 +56,8 @@ pub const Service = struct {
             .relay_head = 0,
             .relay_tail = 0,
             .relay_count = 0,
-            .relay_mutex = .{},
-            .relay_ready = .{},
+            .relay_mutex = .init,
+            .relay_ready = .init,
             .relay_stopping = false,
             .relay_thread = null,
         };
@@ -84,10 +84,10 @@ pub const Service = struct {
     }
 
     fn stopRelayWorker(self: *Service) void {
-        self.relay_mutex.lock();
+        self.relay_mutex.lock(self.io) catch {};
         self.relay_stopping = true;
-        self.relay_ready.broadcast();
-        self.relay_mutex.unlock();
+        self.relay_ready.broadcast(self.io);
+        self.relay_mutex.unlock(self.io);
         if (self.relay_thread) |thread| {
             thread.join();
             self.relay_thread = null;
@@ -95,31 +95,33 @@ pub const Service = struct {
     }
 
     fn enqueueTransaction(self: *Service, tx: transaction.SettlementTx) !void {
-        self.relay_mutex.lock();
-        defer self.relay_mutex.unlock();
+        try self.relay_mutex.lock(self.io);
+        defer self.relay_mutex.unlock(self.io);
         if (self.relay_stopping) return error.RelayWorkerStopped;
         if (self.relay_count == self.relay_queue.len) return error.RelayQueueFull;
 
         self.relay_queue[self.relay_tail] = tx;
         self.relay_tail = (self.relay_tail + 1) % self.relay_queue.len;
         self.relay_count += 1;
-        self.relay_ready.signal();
+        self.relay_ready.signal(self.io);
     }
-
     fn relayLoop(self: *Service) void {
         while (true) {
-            self.relay_mutex.lock();
+            self.relay_mutex.lock(self.io) catch return;
             while (self.relay_count == 0 and !self.relay_stopping) {
-                self.relay_ready.wait(&self.relay_mutex);
+                self.relay_ready.wait(self.io, &self.relay_mutex) catch {
+                    self.relay_mutex.unlock(self.io);
+                    return;
+                };
             }
             if (self.relay_count == 0 and self.relay_stopping) {
-                self.relay_mutex.unlock();
+                self.relay_mutex.unlock(self.io);
                 return;
             }
             const tx = self.relay_queue[self.relay_head];
             self.relay_head = (self.relay_head + 1) % self.relay_queue.len;
             self.relay_count -= 1;
-            self.relay_mutex.unlock();
+            self.relay_mutex.unlock(self.io);
 
             self.broadcastTransaction(tx);
         }

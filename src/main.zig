@@ -10,6 +10,11 @@ const BlockProducerContext = struct {
     batch_size: usize,
 };
 
+const HostPort = struct {
+    host: []const u8,
+    port: u16,
+};
+
 pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
@@ -18,17 +23,54 @@ pub fn main(init: std.process.Init) !void {
     if (args.next()) |command| {
         if (std.mem.eql(u8, command, "node")) {
             const node_id = try nextCount(&args, 0);
-            const peer_port = try nextPort(&args, 7000);
-            const metrics_port = try nextPort(&args, 9000);
-            const peer_one = try nextOptionalPort(&args);
-            const peer_two = try nextOptionalPort(&args);
-            try runNode(init, node_id, peer_port, metrics_port, peer_one, peer_two);
+            var listen_host: []const u8 = "0.0.0.0";
+            var listen_port: u16 = 7000;
+            var metrics_host: []const u8 = "127.0.0.1";
+            var metrics_port: u16 = 9000;
+            var peer_hosts: [8][]const u8 = undefined;
+            var peer_ports: [8]u16 = undefined;
+            var peer_count: usize = 0;
+
+            while (args.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--listen")) {
+                    const value = args.next() orelse return error.MissingListenAddress;
+                    const parsed = try parseHostPort(value, 7000);
+                    listen_host = parsed.host;
+                    listen_port = parsed.port;
+                } else if (std.mem.eql(u8, arg, "--metrics")) {
+                    const value = args.next() orelse return error.MissingMetricsAddress;
+                    const parsed = try parseHostPort(value, 9000);
+                    metrics_host = parsed.host;
+                    metrics_port = parsed.port;
+                } else if (std.mem.eql(u8, arg, "--peer")) {
+                    const value = args.next() orelse return error.MissingPeerAddress;
+                    if (peer_count >= peer_hosts.len) return error.TooManyPeers;
+                    const parsed = try parseHostPort(value, 7000);
+                    peer_hosts[peer_count] = parsed.host;
+                    peer_ports[peer_count] = parsed.port;
+                    peer_count += 1;
+                } else {
+                    return error.UnknownNodeOption;
+                }
+            }
+
+            try runNode(
+                init,
+                node_id,
+                listen_host,
+                listen_port,
+                metrics_host,
+                metrics_port,
+                peer_hosts[0..peer_count],
+                peer_ports[0..peer_count],
+            );
             return;
         }
         if (std.mem.eql(u8, command, "load")) {
-            const peer_port = try nextPort(&args, 7000);
+            const target = args.next() orelse "127.0.0.1:7000";
             const count = try nextCount(&args, 100);
-            try runLoad(init, peer_port, count);
+            const parsed = try parseHostPort(target, 7000);
+            try runLoad(init, parsed.host, parsed.port, count);
             return;
         }
         return error.UnknownCommand;
@@ -37,12 +79,22 @@ pub fn main(init: std.process.Init) !void {
     try runDemo(init);
 }
 
-fn runNode(init: std.process.Init, node_id: u64, peer_port: u16, metrics_port: u16, peer_one: ?u16, peer_two: ?u16) !void {
+fn runNode(
+    init: std.process.Init,
+    node_id: u64,
+    listen_host: []const u8,
+    peer_port: u16,
+    metrics_host: []const u8,
+    metrics_port: u16,
+    peer_hosts: []const []const u8,
+    peer_ports: []const u16,
+) !void {
     var buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(init.io, &buf);
     const stdout = &file_writer.interface;
     const allocator = init.gpa;
     if (node_id > 2) return error.InvalidNodeId;
+
     const node_seed: [32]u8 = @splat(@intCast(node_id + 1));
     const key_pair = try core.KeyPair.generateDeterministic(node_seed);
     const validator_zero_keys = try core.KeyPair.generateDeterministic(@splat(1));
@@ -55,6 +107,7 @@ fn runNode(init: std.process.Init, node_id: u64, peer_port: u16, metrics_port: u
     });
     var node = try core.Node.init(allocator, 0, key_pair, validators, 10_000);
     defer node.deinit();
+
     const sender_keys = try core.KeyPair.generateDeterministic(@splat(9));
     const sender = core.addressFromPublicKey(sender_keys.public_key);
     (try node.chain.state.getOrCreate(sender)).balance = core.toMicro(1_000_000);
@@ -63,17 +116,23 @@ fn runNode(init: std.process.Init, node_id: u64, peer_port: u16, metrics_port: u
         allocator,
         init.io,
         &node,
-        "127.0.0.1",
+        listen_host,
         peer_port,
-        "127.0.0.1",
+        metrics_host,
         metrics_port,
     );
     defer service.deinit();
-    if (peer_one) |port| try service.addPeer("127.0.0.1", port);
-    if (peer_two) |port| try service.addPeer("127.0.0.1", port);
+
+    for (peer_hosts, peer_ports) |host, port| {
+        try service.addPeer(host, port);
+    }
 
     try stdout.print("Aion node started\n", .{});
-    try stdout.print("Peer port: {d}\nMetrics: http://127.0.0.1:{d}/metrics\n", .{ peer_port, metrics_port });
+    try stdout.print("Listen:  {s}:{d}\n", .{ listen_host, peer_port });
+    try stdout.print("Metrics: http://{s}:{d}/metrics\n", .{ metrics_host, metrics_port });
+    for (peer_hosts, peer_ports) |host, port| {
+        try stdout.print("Peer:    {s}:{d}\n", .{ host, port });
+    }
     try stdout.flush();
 
     const metrics_thread = try std.Thread.spawn(.{}, metricsLoop, .{&service});
@@ -94,13 +153,13 @@ fn runNode(init: std.process.Init, node_id: u64, peer_port: u16, metrics_port: u
     }
 }
 
-fn runLoad(init: std.process.Init, peer_port: u16, count: u64) !void {
+fn runLoad(init: std.process.Init, host: []const u8, peer_port: u16, count: u64) !void {
     const allocator = init.gpa;
     const sender_keys = try core.KeyPair.generateDeterministic(@splat(9));
     const sender = core.addressFromPublicKey(sender_keys.public_key);
     const receiver_keys = try core.KeyPair.generateDeterministic(@splat(3));
     const receiver = core.addressFromPublicKey(receiver_keys.public_key);
-    const stream = try core.tcpConnect(init.io, "127.0.0.1", peer_port);
+    const stream = try core.tcpConnect(init.io, host, peer_port);
     defer stream.close(init.io);
 
     var index: u64 = 0;
@@ -117,7 +176,7 @@ fn runLoad(init: std.process.Init, peer_port: u16, count: u64) !void {
 
     var buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(init.io, &buf);
-    try file_writer.interface.print("Submitted {d} signed transactions to peer port {d}\n", .{ count, peer_port });
+    try file_writer.interface.print("Submitted {d} signed transactions to {s}:{d}\n", .{ count, host, peer_port });
     try file_writer.interface.flush();
 }
 
@@ -155,14 +214,15 @@ fn blockProductionLoop(context: *BlockProducerContext) void {
     }
 }
 
-fn nextPort(args: *std.process.Args.Iterator, default: u16) !u16 {
-    const value = args.next() orelse return default;
-    return std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
-}
-
-fn nextOptionalPort(args: *std.process.Args.Iterator) !?u16 {
-    const value = args.next() orelse return null;
-    return std.fmt.parseInt(u16, value, 10) catch return error.InvalidPort;
+fn parseHostPort(value: []const u8, default_port: u16) !HostPort {
+    if (std.mem.lastIndexOfScalar(u8, value, ':')) |idx| {
+        const host = value[0..idx];
+        const port_str = value[idx + 1 ..];
+        if (host.len == 0) return error.InvalidHostPort;
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return error.InvalidPort;
+        return .{ .host = host, .port = port };
+    }
+    return .{ .host = value, .port = default_port };
 }
 
 fn nextCount(args: *std.process.Args.Iterator, default: u64) !u64 {
@@ -180,7 +240,6 @@ fn runDemo(init: std.process.Init) !void {
     try stdout.print("=== Aion Settlement Engine ===\n", .{});
     try stdout.print("Version: {s}\n\n", .{aion.version});
 
-    // Generate real key pairs
     const alice_keys = core.generateKeyPair(init.io);
     const bob_keys = core.generateKeyPair(init.io);
 
@@ -189,7 +248,6 @@ fn runDemo(init: std.process.Init) !void {
 
     try stdout.print("Generated real Ed25519 key pairs for Alice and Bob\n\n", .{});
 
-    // Create state and fund Alice
     var state = core.State.init(allocator);
     defer state.deinit();
 
@@ -203,7 +261,6 @@ fn runDemo(init: std.process.Init) !void {
     try printBalance(stdout, "Bob  ", state.get(bob) orelse core.Account.init());
     try stdout.print("\n", .{});
 
-    // Create, sign and apply a real transaction
     var tx = core.SettlementTx{
         .from = alice,
         .to = bob,

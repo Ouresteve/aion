@@ -111,21 +111,63 @@ pub fn receiveBlockFromReader(reader: *std.Io.Reader, allocator: std.mem.Allocat
     defer allocator.free(frame);
     return codec.decodeBlock(allocator, frame);
 }
-
 fn readFrame(reader: *std.Io.Reader, allocator: std.mem.Allocator) ![]u8 {
     var header: [FRAME_HEADER_SIZE]u8 = undefined;
     try reader.readSliceAll(&header);
 
+    // Version must match the codec version before we allocate or read further.
+    if (header[0] != codec.VERSION) return error.UnsupportedVersion;
+
     const payload_size = std.mem.readInt(u32, header[2..6], .little);
+    if (payload_size == 0) return error.EmptyPayload;
+
     const frame_size = FRAME_HEADER_SIZE + @as(usize, payload_size);
     if (frame_size > MAX_FRAME_SIZE) return error.FrameTooLarge;
 
     const frame = try allocator.alloc(u8, frame_size);
+    errdefer allocator.free(frame);
     @memcpy(frame[0..FRAME_HEADER_SIZE], &header);
     try reader.readSliceAll(frame[FRAME_HEADER_SIZE..]);
     return frame;
 }
-
 test "tcp frame size limit is bounded" {
     try std.testing.expect(MAX_FRAME_SIZE > FRAME_HEADER_SIZE);
+    try std.testing.expect(MAX_FRAME_SIZE <= 1024 * 1024);
+}
+
+test "readFrame rejects unsupported version" {
+    const allocator = std.testing.allocator;
+    // version=9, type=1, length=1
+    const bytes = [_]u8{ 9, 1, 1, 0, 0, 0, 0xAB };
+    var fixed = std.Io.Reader.fixed(&bytes);
+    try std.testing.expectError(error.UnsupportedVersion, readFrame(&fixed, allocator));
+}
+
+test "readFrame rejects empty payload" {
+    const allocator = std.testing.allocator;
+    // version=1, type=1, length=0
+    const bytes = [_]u8{ 1, 1, 0, 0, 0, 0 };
+    var fixed = std.Io.Reader.fixed(&bytes);
+    try std.testing.expectError(error.EmptyPayload, readFrame(&fixed, allocator));
+}
+
+test "readFrame rejects oversize frame" {
+    const allocator = std.testing.allocator;
+    // Claim a payload larger than MAX_FRAME_SIZE
+    var header: [6]u8 = .{ 1, 1, 0, 0, 0, 0 };
+    std.mem.writeInt(u32, header[2..6], @as(u32, @intCast(MAX_FRAME_SIZE)), .little);
+    var fixed = std.Io.Reader.fixed(&header);
+    try std.testing.expectError(error.FrameTooLarge, readFrame(&fixed, allocator));
+}
+
+test "readFrame accepts a minimal valid header+payload" {
+    const allocator = std.testing.allocator;
+    // version=1, type=1, length=1, payload=0xAB
+    const bytes = [_]u8{ 1, 1, 1, 0, 0, 0, 0xAB };
+    var fixed = std.Io.Reader.fixed(&bytes);
+    const frame = try readFrame(&fixed, allocator);
+    defer allocator.free(frame);
+    try std.testing.expectEqual(@as(usize, 7), frame.len);
+    try std.testing.expectEqual(@as(u8, 1), frame[0]);
+    try std.testing.expectEqual(@as(u8, 0xAB), frame[6]);
 }

@@ -403,7 +403,7 @@ test "chain recovers state after restart from durable storage" {
 
     // First run: commit a BFT-finalized transfer and persist it.
     {
-        var storage = try storage_mod.Storage.init(allocator, root);
+        var storage = try storage_mod.Storage.init(allocator, std.testing.io, root);
         defer storage.deinit();
 
         var chain = try Chain.initWithStorage(allocator, &storage, 1);
@@ -440,7 +440,7 @@ test "chain recovers state after restart from durable storage" {
 
     // Second run: pure replay — only balances derived from persisted txs survive.
     {
-        var storage = try storage_mod.Storage.init(allocator, root);
+        var storage = try storage_mod.Storage.init(allocator, std.testing.io, root);
         defer storage.deinit();
 
         var chain = try Chain.initWithStorage(allocator, &storage, 1);

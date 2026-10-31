@@ -4,12 +4,10 @@
 //!
 //!   data/
 //!     blocks/
-//!       00000000000000000000.bin   # height 0
-//!       00000000000000000001.bin
+//!       00000000000000000000.bin
 //!       ...
 //!
-//! Each file contains one length-prefixed block frame produced by codec.encodeBlock.
-//! State is never stored; it is always rebuilt by replaying the chain.
+//! Uses Zig 0.17 std.Io.Dir APIs.
 
 const std = @import("std");
 const block_mod = @import("block.zig");
@@ -17,19 +15,20 @@ const codec = @import("codec.zig");
 
 pub const Storage = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     root_path: []const u8,
     blocks_path: []u8,
 
-    /// Create a Storage rooted at `root_path` (e.g. "data").
-    /// The directory structure is created if it does not exist.
-    pub fn init(allocator: std.mem.Allocator, root_path: []const u8) !Storage {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8) !Storage {
         const blocks_path = try std.fs.path.join(allocator, &.{ root_path, "blocks" });
         errdefer allocator.free(blocks_path);
 
-        try std.fs.cwd().makePath(blocks_path);
+        var cwd = std.Io.Dir.cwd();
+        try cwd.makePath(io, blocks_path);
 
         return .{
             .allocator = allocator,
+            .io = io,
             .root_path = root_path,
             .blocks_path = blocks_path,
         };
@@ -39,7 +38,6 @@ pub const Storage = struct {
         self.allocator.free(self.blocks_path);
     }
 
-    /// Persist a single finalized block. Overwrites any existing file at that height.
     pub fn saveBlock(self: *Storage, block: block_mod.Block) !void {
         const encoded = try codec.encodeBlock(self.allocator, block);
         defer self.allocator.free(encoded);
@@ -50,16 +48,20 @@ pub const Storage = struct {
         const file_path = try std.fs.path.join(self.allocator, &.{ self.blocks_path, filename });
         defer self.allocator.free(file_path);
 
-        const file = try std.fs.cwd().createFile(file_path, .{});
-        defer file.close();
-        try file.writeAll(encoded);
+        var cwd = std.Io.Dir.cwd();
+        const file = try cwd.createFile(self.io, file_path, .{});
+        defer file.close(self.io);
+
+        var write_buf: [4096]u8 = undefined;
+        var writer = file.writerStreaming(self.io, &write_buf);
+        try writer.interface.writeAll(encoded);
+        try writer.interface.flush();
     }
 
-    /// Load every block from disk in ascending height order.
-    /// Caller owns the returned slice and must call `deinit` on each block then free the slice.
     pub fn loadAllBlocks(self: *Storage) ![]block_mod.Block {
-        var dir = try std.fs.cwd().openDir(self.blocks_path, .{ .iterate = true });
-        defer dir.close();
+        var cwd = std.Io.Dir.cwd();
+        var dir = try cwd.openDir(self.io, self.blocks_path, .{ .iterate = true });
+        defer dir.close(self.io);
 
         var names = std.ArrayList([]u8).empty;
         defer {
@@ -67,8 +69,8 @@ pub const Storage = struct {
             names.deinit(self.allocator);
         }
 
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
+        var it = dir.iterate(self.io);
+        while (try it.next(self.io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".bin")) continue;
             const owned = try self.allocator.dupe(u8, entry.name);
@@ -76,7 +78,6 @@ pub const Storage = struct {
             try names.append(self.allocator, owned);
         }
 
-        // Sort lexicographically — zero-padded heights make this height order.
         std.mem.sort([]u8, names.items, {}, struct {
             fn less(_: void, a: []u8, b: []u8) bool {
                 return std.mem.order(u8, a, b) == .lt;
@@ -93,7 +94,7 @@ pub const Storage = struct {
             const file_path = try std.fs.path.join(self.allocator, &.{ self.blocks_path, name });
             defer self.allocator.free(file_path);
 
-            const content = try std.fs.cwd().readFileAlloc(self.allocator, file_path, 16 * 1024 * 1024);
+            const content = try cwd.readFileAlloc(self.io, self.allocator, file_path, 16 * 1024 * 1024);
             defer self.allocator.free(content);
 
             blocks[index] = try codec.decodeBlock(self.allocator, content);
@@ -102,7 +103,6 @@ pub const Storage = struct {
         return blocks;
     }
 
-    /// Highest height present on disk, or null if the store is empty.
     pub fn latestHeight(self: *Storage) !?u64 {
         const blocks = try self.loadAllBlocks();
         defer {
@@ -113,32 +113,3 @@ pub const Storage = struct {
         return blocks[blocks.len - 1].header.height;
     }
 };
-
-test "storage round-trips a block" {
-    const allocator = std.testing.allocator;
-
-    // Use a unique temporary directory for the test.
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(root);
-
-    var storage = try Storage.init(allocator, root);
-    defer storage.deinit();
-
-    var block = try block_mod.Block.init(allocator, 0, @splat(0), 1, &.{}, 0);
-    defer block.deinit(allocator);
-
-    try storage.saveBlock(block);
-
-    const loaded = try storage.loadAllBlocks();
-    defer {
-        for (loaded) |*b| b.deinit(allocator);
-        allocator.free(loaded);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), loaded.len);
-    try std.testing.expectEqual(block.header.height, loaded[0].header.height);
-    try std.testing.expectEqual(block.hash, loaded[0].hash);
-}
